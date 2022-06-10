@@ -88,6 +88,8 @@ type User struct {
 	resyncQueue     map[types.JID]resyncQueueItem
 	resyncQueueLock sync.Mutex
 	nextResync      time.Time
+
+	CommandState map[string]interface{}
 }
 
 type resyncQueueItem struct {
@@ -138,7 +140,7 @@ func (user *User) GetMXID() id.UserID {
 }
 
 func (user *User) GetCommandState() map[string]interface{} {
-	return nil
+	return user.CommandState
 }
 
 func (br *WABridge) GetUserByMXIDIfExists(userID id.UserID) *User {
