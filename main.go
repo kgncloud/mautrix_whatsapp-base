@@ -18,6 +18,7 @@ package main
 
 import (
 	_ "embed"
+	"errors"
 	"net/http"
 	"os"
 	"strconv"
@@ -244,6 +245,24 @@ func (br *WABridge) CheckFeatures(versions *mautrix.RespVersions) (string, bool)
 		}
 	}
 	return "", true
+}
+
+func (br *WABridge) ResolveRoomArg(roomArg string) (roomID id.RoomID, isAlias bool, err error) {
+	// TODO Use stricter check for correct room ID/alias grammar
+	if strings.HasPrefix(roomArg, "!") {
+		roomID = id.RoomID(roomArg)
+	} else if strings.HasPrefix(roomArg, "#") {
+		isAlias = true
+		resp, resolveErr := br.AS.BotIntent().ResolveAlias(id.RoomAlias(roomArg))
+		if resolveErr != nil {
+			err = resolveErr
+		} else {
+			roomID = resp.RoomID
+		}
+	} else {
+		err = errors.New("not a valid room ID or alias")
+	}
+	return
 }
 
 func main() {
