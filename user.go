@@ -496,6 +496,7 @@ func (user *User) createClient(sess *store.Device) {
 	user.Client = whatsmeow.NewClient(sess, &waLogger{user.log.Sub("Client")})
 	user.Client.AddEventHandler(user.HandleEvent)
 	user.Client.SetForceActiveDeliveryReceipts(user.bridge.Config.Bridge.ForceActiveDeliveryReceipts)
+	user.Client.AutomaticMessageRerequestFromPhone = true
 	user.Client.GetMessageForRetry = func(requester, to types.JID, id types.MessageID) *waProto.Message {
 		Segment.Track(user.MXID, "WhatsApp incoming retry (message not found)", map[string]interface{}{
 			"requester": user.obfuscateJID(requester),
@@ -676,7 +677,7 @@ const PhoneMinPingInterval = 24 * time.Hour
 
 func (user *User) sendHackyPhonePing() {
 	user.PhoneLastPinged = time.Now()
-	msgID := whatsmeow.GenerateMessageID()
+	msgID := user.Client.GenerateMessageID()
 	keyIDs := make([]*waProto.AppStateSyncKeyId, 0, 1)
 	lastKeyID, err := user.GetLastAppStateKeyID()
 	if lastKeyID != nil {
@@ -842,7 +843,7 @@ func (user *User) HandleEvent(event interface{}) {
 			user.sendMarkdownBridgeAlert("The bridge was started in another location. Use `reconnect` to reconnect this one.")
 		}
 	case *events.ConnectFailure:
-		user.BridgeState.Send(status.BridgeState{StateEvent: status.StateUnknownError, Message: fmt.Sprintf("Unknown connection failure: %s", v.Reason)})
+		user.BridgeState.Send(status.BridgeState{StateEvent: status.StateUnknownError, Message: fmt.Sprintf("Unknown connection failure: %s (%s)", v.Reason, v.Message)})
 		user.bridge.Metrics.TrackConnectionState(user.JID, false)
 		user.bridge.Metrics.TrackConnectionFailure(fmt.Sprintf("status-%d", v.Reason))
 	case *events.ClientOutdated:
@@ -895,6 +896,9 @@ func (user *User) HandleEvent(event interface{}) {
 		user.handleCallStart(v.CallCreator, v.CallID, v.Type, v.Timestamp)
 	case *events.IdentityChange:
 		puppet := user.bridge.GetPuppetByJID(v.JID)
+		if puppet == nil {
+			return
+		}
 		portal := user.GetPortalByJID(v.JID)
 		if len(portal.MXID) > 0 && user.bridge.Config.Bridge.IdentityChangeNotices {
 			text := fmt.Sprintf("Your security code with %s changed.", puppet.Displayname)
@@ -1220,6 +1224,9 @@ const WATypingTimeout = 15 * time.Second
 
 func (user *User) handleChatPresence(presence *events.ChatPresence) {
 	puppet := user.bridge.GetPuppetByJID(presence.Sender)
+	if puppet == nil {
+		return
+	}
 	portal := user.GetPortalByJID(presence.Chat)
 	if puppet == nil || portal == nil || len(portal.MXID) == 0 {
 		return
@@ -1338,6 +1345,10 @@ func (user *User) handleGroupUpdate(evt *events.GroupInfo) {
 	log := with.Logger()
 	if portal == nil || len(portal.MXID) == 0 {
 		log.Debug().Msg("Ignoring group info update in chat with no portal")
+		return
+	}
+	if evt.Sender != nil && evt.Sender.Server == types.HiddenUserServer {
+		log.Debug().Str("sender", evt.Sender.String()).Msg("Ignoring group info update from @lid user")
 		return
 	}
 	switch {

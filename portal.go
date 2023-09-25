@@ -44,12 +44,20 @@ import (
 	"github.com/chai2010/webp"
 	"github.com/rs/zerolog"
 	"github.com/tidwall/gjson"
+	"go.mau.fi/util/dbutil"
+	"go.mau.fi/util/exerrors"
+	"go.mau.fi/util/exmime"
+	"go.mau.fi/util/ffmpeg"
+	"go.mau.fi/util/random"
+	"go.mau.fi/util/variationselector"
+	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 	"golang.org/x/exp/slices"
 	"golang.org/x/image/draw"
 	"google.golang.org/protobuf/proto"
-
 	log "maunium.net/go/maulogger/v2"
-
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/bridge"
@@ -58,15 +66,6 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
-	"maunium.net/go/mautrix/util"
-	"maunium.net/go/mautrix/util/dbutil"
-	"maunium.net/go/mautrix/util/ffmpeg"
-	"maunium.net/go/mautrix/util/variationselector"
-
-	"go.mau.fi/whatsmeow"
-	waProto "go.mau.fi/whatsmeow/binary/proto"
-	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
 
 	"maunium.net/go/mautrix-whatsapp/database"
 )
@@ -318,7 +317,7 @@ func (portal *Portal) handleMessageLoopItem(msg PortalMessage) {
 	defer portal.latestEventBackfillLock.Unlock()
 	switch {
 	case msg.evt != nil:
-		portal.handleMessage(msg.source, msg.evt)
+		portal.handleMessage(msg.source, msg.evt, false)
 	case msg.receipt != nil:
 		portal.handleReceipt(msg.receipt, msg.source)
 	case msg.undecryptable != nil:
@@ -357,6 +356,10 @@ func (portal *Portal) handleMatrixMessageLoopItem(msg PortalMatrixMessage) {
 }
 
 func (portal *Portal) handleReceipt(receipt *events.Receipt, source *User) {
+	if receipt.Sender.Server != types.DefaultUserServer {
+		// TODO handle lids
+		return
+	}
 	// The order of the message ID array depends on the sender's platform, so we just have to find
 	// the last message based on timestamp. Also, timestamps only have second precision, so if
 	// there are many messages at the same second just mark them all as read, because we don't
@@ -411,7 +414,7 @@ func containsSupportedMessage(waMsg *waProto.Message) bool {
 		return false
 	}
 	return waMsg.Conversation != nil || waMsg.ExtendedTextMessage != nil || waMsg.ImageMessage != nil ||
-		waMsg.StickerMessage != nil || waMsg.AudioMessage != nil || waMsg.VideoMessage != nil ||
+		waMsg.StickerMessage != nil || waMsg.AudioMessage != nil || waMsg.VideoMessage != nil || waMsg.PtvMessage != nil ||
 		waMsg.DocumentMessage != nil || waMsg.ContactMessage != nil || waMsg.LocationMessage != nil ||
 		waMsg.LiveLocationMessage != nil || waMsg.GroupInviteMessage != nil || waMsg.ContactsArrayMessage != nil ||
 		waMsg.HighlyStructuredMessage != nil || waMsg.TemplateMessage != nil || waMsg.TemplateButtonReplyMessage != nil ||
@@ -430,6 +433,8 @@ func getMessageType(waMsg *waProto.Message) string {
 		return fmt.Sprintf("sticker %s", waMsg.GetStickerMessage().GetMimetype())
 	case waMsg.VideoMessage != nil:
 		return fmt.Sprintf("video %s", waMsg.GetVideoMessage().GetMimetype())
+	case waMsg.PtvMessage != nil:
+		return fmt.Sprintf("round video %s", waMsg.GetPtvMessage().GetMimetype())
 	case waMsg.AudioMessage != nil:
 		return fmt.Sprintf("audio %s", waMsg.GetAudioMessage().GetMimetype())
 	case waMsg.DocumentMessage != nil:
@@ -579,6 +584,8 @@ func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User,
 		return portal.convertMediaMessage(intent, source, info, waMsg.GetStickerMessage(), "sticker", isBackfill)
 	case waMsg.VideoMessage != nil:
 		return portal.convertMediaMessage(intent, source, info, waMsg.GetVideoMessage(), "video attachment", isBackfill)
+	case waMsg.PtvMessage != nil:
+		return portal.convertMediaMessage(intent, source, info, waMsg.GetPtvMessage(), "video message", isBackfill)
 	case waMsg.AudioMessage != nil:
 		typeName := "audio attachment"
 		if waMsg.GetAudioMessage().GetPtt() {
@@ -613,6 +620,23 @@ func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User,
 	}
 }
 
+func (portal *Portal) implicitlyEnableDisappearingMessages(timer time.Duration) {
+	portal.ExpirationTime = uint32(timer.Seconds())
+	portal.Update(nil)
+	intent := portal.MainIntent()
+	if portal.Encrypted {
+		intent = portal.bridge.Bot
+	}
+	duration := formatDuration(time.Duration(portal.ExpirationTime) * time.Second)
+	_, err := portal.sendMessage(intent, event.EventMessage, &event.MessageEventContent{
+		MsgType: event.MsgNotice,
+		Body:    fmt.Sprintf("Automatically enabled disappearing message timer (%s) because incoming message is disappearing", duration),
+	}, nil, 0)
+	if err != nil {
+		portal.zlog.Warn().Err(err).Msg("Failed to send notice about implicit disappearing timer")
+	}
+}
+
 func (portal *Portal) UpdateGroupDisappearingMessages(sender *types.JID, timestamp time.Time, timer uint32) {
 	if portal.ExpirationTime == timer {
 		return
@@ -620,7 +644,7 @@ func (portal *Portal) UpdateGroupDisappearingMessages(sender *types.JID, timesta
 	portal.ExpirationTime = timer
 	portal.Update(nil)
 	intent := portal.MainIntent()
-	if sender != nil {
+	if sender != nil && sender.Server == types.DefaultUserServer {
 		intent = portal.bridge.GetPuppetByJID(sender.ToNonAD()).IntentFor(portal)
 	} else {
 		sender = &types.EmptyJID
@@ -691,6 +715,11 @@ func (portal *Portal) handleFakeMessage(msg fakeMessage) {
 		portal.log.Debugfln("Not handling %s (fake): message is duplicate", msg.ID)
 		return
 	}
+	if msg.Sender.Server != types.DefaultUserServer {
+		portal.log.Debugfln("Not handling %s (fake): message is from a lid user (%s)", msg.ID, msg.Sender)
+		// TODO handle lids
+		return
+	}
 	intent := portal.bridge.GetPuppetByJID(msg.Sender).IntentFor(portal)
 	if !intent.IsCustomPuppet && portal.IsPrivateChat() && msg.Sender.User == portal.Key.Receiver.User && portal.Key.Receiver != portal.Key.JID {
 		portal.log.Debugfln("Not handling %s (fake): user doesn't have double puppeting enabled", msg.ID)
@@ -717,7 +746,7 @@ func (portal *Portal) handleFakeMessage(msg fakeMessage) {
 	}
 }
 
-func (portal *Portal) handleMessage(source *User, evt *events.Message) {
+func (portal *Portal) handleMessage(source *User, evt *events.Message, historical bool) {
 	if len(portal.MXID) == 0 {
 		portal.log.Warnln("handleMessage called even though portal.MXID is empty")
 		return
@@ -737,10 +766,15 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 	existingMsg := portal.bridge.DB.Message.GetByJID(portal.Key, msgID)
 	if existingMsg != nil {
 		if existingMsg.Error == database.MsgErrDecryptionFailed {
+			resolveType := "sender"
+			if evt.UnavailableRequestID != "" {
+				resolveType = "phone"
+			}
 			Segment.Track(source.MXID, "WhatsApp undecryptable message resolved", map[string]interface{}{
-				"messageID": evt.Info.ID,
+				"messageID":   evt.Info.ID,
+				"resolveType": resolveType,
 			})
-			portal.log.Debugfln("Got decryptable version of previously undecryptable message %s (%s)", msgID, msgType)
+			portal.log.Debugfln("Got decryptable version of previously undecryptable message %s (%s) via %s", msgID, msgType, resolveType)
 		} else {
 			portal.log.Debugfln("Not handling %s (%s): message is duplicate", msgID, msgType)
 			return
@@ -769,6 +803,14 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 	}
 	converted := portal.convertMessage(intent, source, &evt.Info, evt.Message, false)
 	if converted != nil {
+		if !historical && portal.IsPrivateChat() && evt.Info.Sender.Device == 0 && converted.ExpiresIn > 0 && portal.ExpirationTime == 0 {
+			portal.zlog.Info().
+				Str("timer", converted.ExpiresIn.String()).
+				Str("sender_jid", evt.Info.Sender.String()).
+				Str("message_id", evt.Info.ID).
+				Msg("Implicitly enabling disappearing messages as incoming message is disappearing")
+			portal.implicitlyEnableDisappearingMessages(converted.ExpiresIn)
+		}
 		if evt.Info.IsIncomingBroadcast() {
 			if converted.Extra == nil {
 				converted.Extra = map[string]interface{}{}
@@ -1042,6 +1084,10 @@ func (portal *Portal) SyncParticipants(source *User, metadata *types.GroupInfo) 
 	participantMap := make(map[types.JID]bool)
 	userIDs := make([]id.UserID, 0, len(metadata.Participants))
 	for _, participant := range metadata.Participants {
+		if participant.JID.IsEmpty() || participant.JID.Server != types.DefaultUserServer {
+			// TODO handle lids
+			continue
+		}
 		portal.log.Debugfln("Syncing participant %s (admin: %t)", participant.JID, participant.IsAdmin)
 		participantMap[participant.JID] = true
 		puppet := portal.bridge.GetPuppetByJID(participant.JID)
@@ -1163,7 +1209,7 @@ func (portal *Portal) UpdateAvatar(user *User, setBy types.JID, updateInfo bool)
 
 	if len(portal.MXID) > 0 {
 		intent := portal.MainIntent()
-		if !setBy.IsEmpty() {
+		if !setBy.IsEmpty() && setBy.Server == types.DefaultUserServer {
 			intent = portal.bridge.GetPuppetByJID(setBy).IntentFor(portal)
 		}
 		_, err := intent.SetRoomAvatar(portal.MXID, portal.AvatarURL)
@@ -1201,7 +1247,7 @@ func (portal *Portal) UpdateName(name string, setBy types.JID, updateInfo bool) 
 			portal.UpdateBridgeInfo()
 		} else if len(portal.MXID) > 0 {
 			intent := portal.MainIntent()
-			if !setBy.IsEmpty() {
+			if !setBy.IsEmpty() && setBy.Server == types.DefaultUserServer {
 				intent = portal.bridge.GetPuppetByJID(setBy).IntentFor(portal)
 			}
 			_, err := intent.SetRoomName(portal.MXID, name)
@@ -1230,7 +1276,7 @@ func (portal *Portal) UpdateTopic(topic string, setBy types.JID, updateInfo bool
 		portal.TopicSet = false
 
 		intent := portal.MainIntent()
-		if !setBy.IsEmpty() {
+		if !setBy.IsEmpty() && setBy.Server == types.DefaultUserServer {
 			intent = portal.bridge.GetPuppetByJID(setBy).IntentFor(portal)
 		}
 		_, err := intent.SetRoomTopic(portal.MXID, topic)
@@ -1401,6 +1447,10 @@ func (portal *Portal) ChangeAdminStatus(jids []types.JID, setAdmin bool) id.Even
 	}
 	changed := portal.applyPowerLevelFixes(levels)
 	for _, jid := range jids {
+		if jid.Server != types.DefaultUserServer {
+			// TODO handle lids
+			continue
+		}
 		puppet := portal.bridge.GetPuppetByJID(jid)
 		changed = levels.EnsureUserLevel(puppet.MXID, newLevel) || changed
 
@@ -1932,7 +1982,8 @@ func (portal *Portal) addReplyMention(content *event.MessageEventContent, sender
 	if content.Mentions == nil || (sender.IsEmpty() && senderMXID == "") {
 		return
 	}
-	if senderMXID == "" {
+	// TODO handle lids
+	if senderMXID == "" && sender.Server == types.DefaultUserServer {
 		if user := portal.bridge.GetUserByJID(sender); user != nil {
 			senderMXID = user.MXID
 		} else {
@@ -2330,7 +2381,7 @@ func (portal *Portal) convertListMessage(intent *appservice.IntentAPI, source *U
 			body = fmt.Sprintf("%s\n\n%s", msg.GetTitle(), body)
 		}
 	}
-	randomID := util.RandomString(64)
+	randomID := random.String(64)
 	body = fmt.Sprintf("%s\n%s", body, randomID)
 	if msg.GetFooterText() != "" {
 		body = fmt.Sprintf("%s\n\n%s", body, msg.GetFooterText())
@@ -2740,6 +2791,10 @@ func (portal *Portal) HandleWhatsAppKick(source *User, senderJID types.JID, jids
 	sender := portal.bridge.GetPuppetByJID(senderJID)
 	senderIntent := sender.IntentFor(portal)
 	for _, jid := range jids {
+		if jid.Server != types.DefaultUserServer {
+			// TODO handle lids
+			continue
+		}
 		//if source != nil && source.JID.User == jid.User {
 		//	portal.log.Debugln("Ignoring self-kick by", source.MXID)
 		//	continue
@@ -2767,6 +2822,10 @@ func (portal *Portal) HandleWhatsAppInvite(source *User, senderJID *types.JID, j
 		intent = sender.IntentFor(portal)
 	}
 	for _, jid := range jids {
+		if jid.Server != types.DefaultUserServer {
+			// TODO handle lids
+			continue
+		}
 		puppet := portal.bridge.GetPuppetByJID(jid)
 		puppet.SyncContact(source, true, false, "handling whatsapp invite")
 		resp, err := intent.SendStateEvent(portal.MXID, event.StateMember, puppet.MXID.String(), &event.MemberEventContent{
@@ -2938,7 +2997,7 @@ func (portal *Portal) convertMediaMessageContent(intent *appservice.IntentAPI, m
 			content.Body = mimeClass
 		}
 
-		content.Body += util.ExtensionFromMimetype(msg.GetMimetype())
+		content.Body += exmime.ExtensionFromMimetype(msg.GetMimetype())
 	}
 
 	msgWithDuration, ok := msg.(MediaMessageWithDuration)
@@ -3240,6 +3299,10 @@ func (portal *Portal) handleMediaRetry(retry *events.MediaRetry, source *User) {
 	} else {
 		puppet = portal.bridge.GetPuppetByJID(retry.SenderID)
 	}
+	if puppet == nil {
+		// TODO handle lids?
+		return
+	}
 	intent := puppet.IntentFor(portal)
 
 	retryData, err := whatsmeow.DecryptMediaRetryNotification(retry, meta.Media.Key)
@@ -3490,12 +3553,12 @@ func (portal *Portal) preprocessMatrixMedia(ctx context.Context, sender *User, r
 	}
 	data, err := portal.MainIntent().DownloadBytesContext(ctx, mxc)
 	if err != nil {
-		return nil, util.NewDualError(errMediaDownloadFailed, err)
+		return nil, exerrors.NewDualError(errMediaDownloadFailed, err)
 	}
 	if file != nil {
 		err = file.DecryptInPlace(data)
 		if err != nil {
-			return nil, util.NewDualError(errMediaDecryptFailed, err)
+			return nil, exerrors.NewDualError(errMediaDecryptFailed, err)
 		}
 	}
 	mimeType := content.GetInfo().MimeType
@@ -3550,7 +3613,7 @@ func (portal *Portal) preprocessMatrixMedia(ctx context.Context, sender *User, r
 	}
 	if convertErr != nil {
 		if content.Info.MimeType != mimeType || data == nil {
-			return nil, util.NewDualError(fmt.Errorf("%w (%s to %s)", errMediaConvertFailed, mimeType, content.Info.MimeType), convertErr)
+			return nil, exerrors.NewDualError(fmt.Errorf("%w (%s to %s)", errMediaConvertFailed, mimeType, content.Info.MimeType), convertErr)
 		} else {
 			// If the mime type didn't change and the errored conversion function returned the original data, just log a warning and continue
 			portal.log.Warnfln("Failed to re-encode %s media: %v, continuing with original file", mimeType, convertErr)
@@ -3558,7 +3621,7 @@ func (portal *Portal) preprocessMatrixMedia(ctx context.Context, sender *User, r
 	}
 	uploadResp, err := sender.Client.Upload(ctx, data, mediaType)
 	if err != nil {
-		return nil, util.NewDualError(errMediaWhatsAppUploadFailed, err)
+		return nil, exerrors.NewDualError(errMediaWhatsAppUploadFailed, err)
 	}
 
 	// Audio doesn't have thumbnails
@@ -4103,7 +4166,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 
 func (portal *Portal) generateMessageInfo(sender *User) *types.MessageInfo {
 	return &types.MessageInfo{
-		ID:        whatsmeow.GenerateMessageID(),
+		ID:        sender.Client.GenerateMessageID(),
 		Timestamp: time.Now(),
 		MessageSource: types.MessageSource{
 			Sender:   sender.JID,
@@ -4115,12 +4178,16 @@ func (portal *Portal) generateMessageInfo(sender *User) *types.MessageInfo {
 }
 
 func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event, timings messageTimings) {
-	start := time.Now()
-	ms := metricSender{portal: portal, timings: &timings}
 	if portal.bridge.PuppetActivity.isBlocked {
 		portal.log.Warnln("Bridge is blocking messages")
 		return
 	}
+	start := time.Now()
+	ms := metricSender{portal: portal, timings: &timings}
+	log := portal.zlog.With().
+		Str("event_id", evt.ID.String()).
+		Str("action", "handle matrix message").
+		Logger()
 
 	allowRelay := evt.Type != TypeMSC3381PollResponse && evt.Type != TypeMSC3381V2PollResponse && evt.Type != TypeMSC3381PollStart
 	if err := portal.canBridgeFrom(sender, allowRelay, true); err != nil {
@@ -4179,6 +4246,7 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event, timing
 		ctx, cancel = context.WithTimeout(ctx, deadline)
 		defer cancel()
 	}
+	ctx = log.WithContext(ctx)
 
 	timings.preproc = time.Since(start)
 	start = time.Now()

@@ -27,6 +27,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"go.mau.fi/util/configupgrade"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store"
@@ -38,7 +39,6 @@ import (
 	"maunium.net/go/mautrix/bridge/status"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
-	"maunium.net/go/mautrix/util/configupgrade"
 
 	"maunium.net/go/mautrix-whatsapp/config"
 	"maunium.net/go/mautrix-whatsapp/database"
@@ -271,7 +271,7 @@ func main() {
 		Name:              "mautrix-whatsapp",
 		URL:               "https://github.com/vector-im/mautrix-whatsapp",
 		Description:       "A Matrix-WhatsApp puppeting bridge.",
-		Version:           "0.9.0-mod-1",
+		Version:           "0.10.0-mod-1",
 		ProtocolName:      "WhatsApp",
 		BeeperServiceName: "whatsapp",
 		BeeperNetworkName: "whatsapp",
