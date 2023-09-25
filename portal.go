@@ -48,6 +48,7 @@ import (
 	"go.mau.fi/util/exerrors"
 	"go.mau.fi/util/exmime"
 	"go.mau.fi/util/ffmpeg"
+	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/random"
 	"go.mau.fi/util/variationselector"
 	"go.mau.fi/whatsmeow"
@@ -62,6 +63,7 @@ import (
 	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/bridge"
 	"maunium.net/go/mautrix/bridge/bridgeconfig"
+	"maunium.net/go/mautrix/bridge/status"
 	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
@@ -286,10 +288,48 @@ type Portal struct {
 
 	mediaErrorCache map[types.MessageID]*FailedMediaMeta
 
+	galleryCache          []*event.MessageEventContent
+	galleryCacheRootEvent id.EventID
+	galleryCacheStart     time.Time
+	galleryCacheReplyTo   *ReplyInfo
+	galleryCacheSender    types.JID
+
 	currentlySleepingToDelete sync.Map
 
 	relayUser    *User
 	parentPortal *Portal
+}
+
+const GalleryMaxTime = 10 * time.Minute
+
+func (portal *Portal) stopGallery() {
+	if portal.galleryCache != nil {
+		portal.galleryCache = nil
+		portal.galleryCacheSender = types.EmptyJID
+		portal.galleryCacheReplyTo = nil
+		portal.galleryCacheStart = time.Time{}
+		portal.galleryCacheRootEvent = ""
+	}
+}
+
+func (portal *Portal) startGallery(evt *events.Message, msg *ConvertedMessage) {
+	portal.galleryCache = []*event.MessageEventContent{msg.Content}
+	portal.galleryCacheSender = evt.Info.Sender.ToNonAD()
+	portal.galleryCacheReplyTo = msg.ReplyTo
+	portal.galleryCacheStart = time.Now()
+}
+
+func (portal *Portal) extendGallery(msg *ConvertedMessage) int {
+	portal.galleryCache = append(portal.galleryCache, msg.Content)
+	msg.Content = &event.MessageEventContent{
+		MsgType:             event.MsgBeeperGallery,
+		Body:                "Sent a gallery",
+		BeeperGalleryImages: portal.galleryCache,
+	}
+	msg.Content.SetEdit(portal.galleryCacheRootEvent)
+	// Don't set the gallery images in the edit fallback
+	msg.Content.BeeperGalleryImages = nil
+	return len(portal.galleryCache) - 1
 }
 
 var (
@@ -300,7 +340,7 @@ var (
 	_ bridge.TypingPortal              = (*Portal)(nil)
 )
 
-func (portal *Portal) handleMessageLoopItem(msg PortalMessage) {
+func (portal *Portal) handleWhatsAppMessageLoopItem(msg PortalMessage) {
 	if len(portal.MXID) == 0 {
 		if msg.fake == nil && msg.undecryptable == nil && (msg.evt == nil || !containsSupportedMessage(msg.evt.Message)) {
 			portal.log.Debugln("Not creating portal room for incoming message: message is not a chat message")
@@ -321,8 +361,10 @@ func (portal *Portal) handleMessageLoopItem(msg PortalMessage) {
 	case msg.receipt != nil:
 		portal.handleReceipt(msg.receipt, msg.source)
 	case msg.undecryptable != nil:
+		portal.stopGallery()
 		portal.handleUndecryptableMessage(msg.source, msg.undecryptable)
 	case msg.fake != nil:
+		portal.stopGallery()
 		msg.fake.ID = "FAKE::" + msg.fake.ID
 		portal.handleFakeMessage(*msg.fake)
 	default:
@@ -355,9 +397,36 @@ func (portal *Portal) handleMatrixMessageLoopItem(msg PortalMatrixMessage) {
 	}
 }
 
+func (portal *Portal) handleDeliveryReceipt(receipt *events.Receipt, source *User) {
+	if !portal.IsPrivateChat() {
+		return
+	}
+	for _, msgID := range receipt.MessageIDs {
+		msg := portal.bridge.DB.Message.GetByJID(portal.Key, msgID)
+		if msg == nil || msg.IsFakeMXID() {
+			continue
+		}
+		if msg.Sender == source.JID {
+			portal.bridge.SendRawMessageCheckpoint(&status.MessageCheckpoint{
+				EventID:    msg.MXID,
+				RoomID:     portal.MXID,
+				Step:       status.MsgStepRemote,
+				Timestamp:  jsontime.UM(receipt.Timestamp),
+				Status:     status.MsgStatusDelivered,
+				ReportedBy: status.MsgReportedByBridge,
+			})
+			portal.sendStatusEvent(msg.MXID, "", nil, &[]id.UserID{portal.MainIntent().UserID})
+		}
+	}
+}
+
 func (portal *Portal) handleReceipt(receipt *events.Receipt, source *User) {
 	if receipt.Sender.Server != types.DefaultUserServer {
 		// TODO handle lids
+		return
+	}
+	if receipt.Type == events.ReceiptTypeDelivered {
+		portal.handleDeliveryReceipt(receipt, source)
 		return
 	}
 	// The order of the message ID array depends on the sender's platform, so we just have to find
@@ -398,14 +467,31 @@ func (portal *Portal) handleReceipt(receipt *events.Receipt, source *User) {
 
 func (portal *Portal) handleMessageLoop() {
 	for {
-		select {
-		case msg := <-portal.messages:
-			portal.handleMessageLoopItem(msg)
-		case msg := <-portal.matrixMessages:
-			portal.handleMatrixMessageLoopItem(msg)
-		case retry := <-portal.mediaRetries:
-			portal.handleMediaRetry(retry.evt, retry.source)
+		portal.handleOneMessageLoopItem()
+	}
+}
+
+func (portal *Portal) handleOneMessageLoopItem() {
+	defer func() {
+		if err := recover(); err != nil {
+			logEvt := portal.zlog.WithLevel(zerolog.FatalLevel).
+				Str(zerolog.ErrorStackFieldName, string(debug.Stack()))
+			actualErr, ok := err.(error)
+			if ok {
+				logEvt = logEvt.Err(actualErr)
+			} else {
+				logEvt = logEvt.Any(zerolog.ErrorFieldName, err)
+			}
+			logEvt.Msg("Portal message handler panicked")
 		}
+	}()
+	select {
+	case msg := <-portal.messages:
+		portal.handleWhatsAppMessageLoopItem(msg)
+	case msg := <-portal.matrixMessages:
+		portal.handleMatrixMessageLoopItem(msg)
+	case retry := <-portal.mediaRetries:
+		portal.handleMediaRetry(retry.evt, retry.source)
 	}
 }
 
@@ -704,7 +790,7 @@ func (portal *Portal) handleUndecryptableMessage(source *User, evt *events.Undec
 		portal.log.Errorfln("Failed to send decryption error of %s to Matrix: %v", evt.Info.ID, err)
 		return
 	}
-	portal.finishHandling(nil, &evt.Info, resp.EventID, intent.UserID, database.MsgUnknown, database.MsgErrDecryptionFailed)
+	portal.finishHandling(nil, &evt.Info, resp.EventID, intent.UserID, database.MsgUnknown, 0, database.MsgErrDecryptionFailed)
 }
 
 func (portal *Portal) handleFakeMessage(msg fakeMessage) {
@@ -742,7 +828,7 @@ func (portal *Portal) handleFakeMessage(msg fakeMessage) {
 			MessageSource: types.MessageSource{
 				Sender: msg.Sender,
 			},
-		}, resp.EventID, intent.UserID, database.MsgFake, database.MsgNoError)
+		}, resp.EventID, intent.UserID, database.MsgFake, 0, database.MsgNoError)
 	}
 }
 
@@ -803,6 +889,17 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message, historica
 	}
 	converted := portal.convertMessage(intent, source, &evt.Info, evt.Message, false)
 	if converted != nil {
+		isGalleriable := portal.bridge.Config.Bridge.BeeperGalleries &&
+			(evt.Message.ImageMessage != nil || evt.Message.VideoMessage != nil) &&
+			(portal.galleryCache == nil ||
+				(evt.Info.Sender.ToNonAD() == portal.galleryCacheSender &&
+					converted.ReplyTo.Equals(portal.galleryCacheReplyTo) &&
+					time.Since(portal.galleryCacheStart) < GalleryMaxTime)) &&
+			// Captions aren't allowed in galleries (this needs to be checked before the caption is merged)
+			converted.Caption == nil &&
+			// Images can't be edited
+			editTargetMsg == nil
+
 		if !historical && portal.IsPrivateChat() && evt.Info.Sender.Device == 0 && converted.ExpiresIn > 0 && portal.ExpirationTime == 0 {
 			portal.zlog.Info().
 				Str("timer", converted.ExpiresIn.String()).
@@ -833,6 +930,20 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message, historica
 			dbMsgType = database.MsgEdit
 			converted.Content.SetEdit(editTargetMsg.MXID)
 		}
+		galleryStarted := false
+		var galleryPart int
+		if isGalleriable {
+			if portal.galleryCache == nil {
+				portal.startGallery(evt, converted)
+				galleryStarted = true
+			} else {
+				galleryPart = portal.extendGallery(converted)
+				dbMsgType = database.MsgBeeperGallery
+			}
+		} else if editTargetMsg == nil {
+			// Stop collecting a gallery (except if it's an edit)
+			portal.stopGallery()
+		}
 		resp, err := portal.sendMessage(converted.Intent, converted.Type, converted.Content, converted.Extra, evt.Info.Timestamp.UnixMilli())
 		if err != nil {
 			portal.log.Errorfln("Failed to send %s to Matrix: %v", msgID, err)
@@ -842,6 +953,11 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message, historica
 			}
 			eventID = resp.EventID
 			lastEventID = eventID
+			if galleryStarted {
+				portal.galleryCacheRootEvent = eventID
+			} else if galleryPart != 0 {
+				eventID = portal.galleryCacheRootEvent
+			}
 		}
 		// TODO figure out how to handle captions with undecryptable messages turning decryptable
 		if converted.Caption != nil && existingMsg == nil && editTargetMsg == nil {
@@ -874,7 +990,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message, historica
 			}
 		}
 		if len(eventID) != 0 {
-			portal.finishHandling(existingMsg, &evt.Info, eventID, intent.UserID, dbMsgType, converted.Error)
+			portal.finishHandling(existingMsg, &evt.Info, eventID, intent.UserID, dbMsgType, galleryPart, converted.Error)
 		}
 	} else if msgType == "reaction" || msgType == "encrypted reaction" {
 		if evt.Message.GetEncReactionMessage() != nil {
@@ -936,12 +1052,13 @@ func (portal *Portal) isRecentlyHandled(id types.MessageID, error database.Messa
 	return false
 }
 
-func (portal *Portal) markHandled(txn dbutil.Transaction, msg *database.Message, info *types.MessageInfo, mxid id.EventID, senderMXID id.UserID, isSent, recent bool, msgType database.MessageType, errType database.MessageErrorType) *database.Message {
+func (portal *Portal) markHandled(txn dbutil.Transaction, msg *database.Message, info *types.MessageInfo, mxid id.EventID, senderMXID id.UserID, isSent, recent bool, msgType database.MessageType, galleryPart int, errType database.MessageErrorType) *database.Message {
 	if msg == nil {
 		msg = portal.bridge.DB.Message.New()
 		msg.Chat = portal.Key
 		msg.JID = info.ID
 		msg.MXID = mxid
+		msg.GalleryPart = galleryPart
 		msg.Timestamp = info.Timestamp
 		msg.Sender = info.Sender
 		msg.SenderMXID = senderMXID
@@ -996,8 +1113,8 @@ func (portal *Portal) getMessageIntent(user *User, info *types.MessageInfo, msgT
 	return intent
 }
 
-func (portal *Portal) finishHandling(existing *database.Message, message *types.MessageInfo, mxid id.EventID, senderMXID id.UserID, msgType database.MessageType, errType database.MessageErrorType) {
-	portal.markHandled(nil, existing, message, mxid, senderMXID, true, true, msgType, errType)
+func (portal *Portal) finishHandling(existing *database.Message, message *types.MessageInfo, mxid id.EventID, senderMXID id.UserID, msgType database.MessageType, galleryPart int, errType database.MessageErrorType) {
+	portal.markHandled(nil, existing, message, mxid, senderMXID, true, true, msgType, galleryPart, errType)
 	portal.sendDeliveryReceipt(mxid)
 	var suffix string
 	if errType == database.MsgErrDecryptionFailed {
@@ -1085,6 +1202,7 @@ func (portal *Portal) SyncParticipants(source *User, metadata *types.GroupInfo) 
 	userIDs := make([]id.UserID, 0, len(metadata.Participants))
 	for _, participant := range metadata.Participants {
 		if participant.JID.IsEmpty() || participant.JID.Server != types.DefaultUserServer {
+			wg.Done()
 			// TODO handle lids
 			continue
 		}
@@ -2078,7 +2196,7 @@ func (portal *Portal) HandleMessageReaction(intent *appservice.IntentAPI, user *
 		if err != nil {
 			portal.log.Errorfln("Failed to redact reaction %s/%s from %s to %s: %v", existing.MXID, existing.JID, info.Sender, targetJID, err)
 		}
-		portal.finishHandling(existingMsg, info, resp.EventID, intent.UserID, database.MsgReaction, database.MsgNoError)
+		portal.finishHandling(existingMsg, info, resp.EventID, intent.UserID, database.MsgReaction, 0, database.MsgNoError)
 		existing.Delete()
 	} else {
 		target := portal.bridge.DB.Message.GetByJID(portal.Key, targetJID)
@@ -2099,7 +2217,7 @@ func (portal *Portal) HandleMessageReaction(intent *appservice.IntentAPI, user *
 			return
 		}
 
-		portal.finishHandling(existingMsg, info, resp.EventID, intent.UserID, database.MsgReaction, database.MsgNoError)
+		portal.finishHandling(existingMsg, info, resp.EventID, intent.UserID, database.MsgReaction, 0, database.MsgNoError)
 		portal.upsertReaction(nil, intent, target.JID, info.Sender, resp.EventID, info.ID)
 	}
 }
@@ -2185,6 +2303,15 @@ type ReplyInfo struct {
 	MessageID types.MessageID
 	Chat      types.JID
 	Sender    types.JID
+}
+
+func (r *ReplyInfo) Equals(other *ReplyInfo) bool {
+	if r == nil {
+		return other == nil
+	} else if other == nil {
+		return false
+	}
+	return r.MessageID == other.MessageID && r.Chat == other.Chat && r.Sender == other.Sender
 }
 
 func (r ReplyInfo) MarshalZerologObject(e *zerolog.Event) {
@@ -3865,7 +3992,6 @@ func (portal *Portal) convertMatrixPollStart(_ context.Context, sender *User, ev
 	if maxAnswers >= len(content.PollStart.Answers) || maxAnswers < 0 {
 		maxAnswers = 0
 	}
-	fmt.Printf("%+v\n", content.PollStart)
 	ctxInfo := portal.generateContextInfo(content.RelatesTo)
 	var question string
 	question, ctxInfo.MentionedJid = portal.msc1767ToWhatsApp(content.PollStart.Question, true)
@@ -3906,7 +4032,7 @@ func (portal *Portal) generateContextInfo(relatesTo *event.RelatesTo) *waProto.C
 	replyToID := relatesTo.GetReplyTo()
 	if len(replyToID) > 0 {
 		replyToMsg := portal.bridge.DB.Message.GetByMXID(replyToID)
-		if replyToMsg != nil && !replyToMsg.IsFakeJID() && (replyToMsg.Type == database.MsgNormal || replyToMsg.Type == database.MsgMatrixPoll) {
+		if replyToMsg != nil && !replyToMsg.IsFakeJID() && (replyToMsg.Type == database.MsgNormal || replyToMsg.Type == database.MsgMatrixPoll || replyToMsg.Type == database.MsgBeeperGallery) {
 			ctxInfo.StanzaId = &replyToMsg.JID
 			ctxInfo.Participant = proto.String(replyToMsg.Sender.ToNonAD().String())
 			// Using blank content here seems to work fine on all official WhatsApp apps.
@@ -4266,7 +4392,7 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event, timing
 	}
 	info := portal.generateMessageInfo(sender)
 	if dbMsg == nil {
-		dbMsg = portal.markHandled(nil, nil, info, evt.ID, evt.Sender, false, true, dbMsgType, database.MsgNoError)
+		dbMsg = portal.markHandled(nil, nil, info, evt.ID, evt.Sender, false, true, dbMsgType, 0, database.MsgNoError)
 	} else {
 		info.ID = dbMsg.JID
 	}
@@ -4321,7 +4447,7 @@ func (portal *Portal) handleMatrixReaction(sender *User, evt *event.Event) error
 		return fmt.Errorf("unknown target event %s", content.RelatesTo.EventID)
 	}
 	info := portal.generateMessageInfo(sender)
-	dbMsg := portal.markHandled(nil, nil, info, evt.ID, evt.Sender, false, true, database.MsgReaction, database.MsgNoError)
+	dbMsg := portal.markHandled(nil, nil, info, evt.ID, evt.Sender, false, true, database.MsgReaction, 0, database.MsgNoError)
 	portal.upsertReaction(nil, nil, target.JID, sender.JID, evt.ID, info.ID)
 	portal.log.Debugln("Sending reaction", evt.ID, "to WhatsApp", info.ID)
 	resp, err := portal.sendReactionToWhatsApp(sender, info.ID, target, content.RelatesTo.Key, evt.Timestamp)
