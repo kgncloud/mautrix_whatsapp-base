@@ -1,7 +1,7 @@
 ## Element fork
 
 The Element fork includes the following changes:
-- [Track "active" WhatsApp users and implement blocking when reaching the limit](https://github.com/tulir/mautrix-whatsapp/pull/323)
+- [Track "active" WhatsApp users and implement blocking when reaching the limit](https://github.com/mautrix/whatsapp/pull/323)
 
 Some changes that appear here may get upstreamed to https://github.com/mautrix/whatsapp, and will be removed from
 the list when they appear in both versions.
