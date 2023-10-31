@@ -41,7 +41,6 @@ import (
 	"sync"
 	"time"
 
-	cwebp "github.com/chai2010/webp"
 	"github.com/rs/zerolog"
 	"github.com/tidwall/gjson"
 	"go.mau.fi/util/dbutil"
@@ -51,6 +50,7 @@ import (
 	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/random"
 	"go.mau.fi/util/variationselector"
+	cwebp "go.mau.fi/webp"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
@@ -348,7 +348,7 @@ func (portal *Portal) handleWhatsAppMessageLoopItem(msg PortalMessage) {
 			return
 		}
 		portal.log.Debugln("Creating Matrix room from incoming message")
-		err := portal.CreateMatrixRoom(msg.source, nil, false, true)
+		err := portal.CreateMatrixRoom(msg.source, nil, nil, false, true)
 		if err != nil {
 			portal.log.Errorln("Failed to create portal room:", err)
 			return
@@ -777,7 +777,7 @@ func (portal *Portal) handleUndecryptableMessage(source *User, evt *events.Undec
 	if evt.IsUnavailable {
 		metricType = "unavailable"
 	}
-	Segment.Track(source.MXID, "WhatsApp undecryptable message", map[string]interface{}{
+	Analytics.Track(source.MXID, "WhatsApp undecryptable message", map[string]interface{}{
 		"messageID":         evt.Info.ID,
 		"undecryptableType": metricType,
 	})
@@ -857,7 +857,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message, historica
 			if evt.UnavailableRequestID != "" {
 				resolveType = "phone"
 			}
-			Segment.Track(source.MXID, "WhatsApp undecryptable message resolved", map[string]interface{}{
+			Analytics.Track(source.MXID, "WhatsApp undecryptable message resolved", map[string]interface{}{
 				"messageID":   evt.Info.ID,
 				"resolveType": resolveType,
 			})
@@ -1102,6 +1102,9 @@ func (portal *Portal) getMessagePuppet(user *User, info *types.MessageInfo) (pup
 }
 
 func (portal *Portal) getMessageIntent(user *User, info *types.MessageInfo, msgType string) *appservice.IntentAPI {
+	if portal.IsNewsletter() && info.Sender == info.Chat {
+		return portal.MainIntent()
+	}
 	puppet := portal.getMessagePuppet(user, info)
 	if puppet == nil {
 		return nil
@@ -1186,6 +1189,9 @@ func (portal *Portal) syncParticipant(source *User, participant types.GroupParti
 }
 
 func (portal *Portal) SyncParticipants(source *User, metadata *types.GroupInfo) ([]id.UserID, *event.PowerLevelsEventContent) {
+	if portal.IsNewsletter() {
+		return nil, nil
+	}
 	changed := false
 	var levels *event.PowerLevelsEventContent
 	var err error
@@ -1264,6 +1270,18 @@ func reuploadAvatar(intent *appservice.IntentAPI, url string) (id.ContentURI, er
 	return resp.ContentURI, nil
 }
 
+func (user *User) reuploadAvatarDirectPath(intent *appservice.IntentAPI, directPath string) (id.ContentURI, error) {
+	data, err := user.Client.DownloadMediaWithPath(directPath, nil, nil, nil, 0, "", "")
+	if err != nil {
+		return id.ContentURI{}, fmt.Errorf("failed to download avatar: %w", err)
+	}
+	resp, err := intent.UploadBytes(data, http.DetectContentType(data))
+	if err != nil {
+		return id.ContentURI{}, fmt.Errorf("failed to upload avatar to Matrix: %w", err)
+	}
+	return resp.ContentURI, nil
+}
+
 func (user *User) updateAvatar(jid types.JID, isCommunity bool, avatarID *string, avatarURL *id.ContentURI, avatarSet *bool, log log.Logger, intent *appservice.IntentAPI) bool {
 	currentID := ""
 	if *avatarSet && *avatarID != "remove" && *avatarID != "unauthorized" {
@@ -1298,14 +1316,23 @@ func (user *User) updateAvatar(jid types.JID, isCommunity bool, avatarID *string
 	}
 	if avatar.ID == *avatarID && *avatarSet {
 		return false
-	} else if len(avatar.URL) == 0 {
+	} else if len(avatar.URL) == 0 && len(avatar.DirectPath) == 0 {
 		log.Warnln("Didn't get URL in response to avatar query")
 		return false
 	} else if avatar.ID != *avatarID || avatarURL.IsEmpty() {
-		url, err := reuploadAvatar(intent, avatar.URL)
-		if err != nil {
-			log.Warnln("Failed to reupload avatar:", err)
-			return false
+		var url id.ContentURI
+		if len(avatar.URL) > 0 {
+			url, err = reuploadAvatar(intent, avatar.URL)
+			if err != nil {
+				log.Warnln("Failed to reupload avatar:", err)
+				return false
+			}
+		} else {
+			url, err = user.reuploadAvatarDirectPath(intent, avatar.DirectPath)
+			if err != nil {
+				log.Warnln("Failed to reupload avatar:", err)
+				return false
+			}
 		}
 		*avatarURL = url
 	}
@@ -1315,10 +1342,61 @@ func (user *User) updateAvatar(jid types.JID, isCommunity bool, avatarID *string
 	return true
 }
 
+func (portal *Portal) UpdateNewsletterAvatar(user *User, meta *types.NewsletterMetadata) bool {
+	portal.avatarLock.Lock()
+	defer portal.avatarLock.Unlock()
+	var picID string
+	picture := meta.ThreadMeta.Picture
+	if picture == nil {
+		picID = meta.ThreadMeta.Preview.ID
+	} else {
+		picID = picture.ID
+	}
+	if picID == "" {
+		picID = "remove"
+	}
+	if portal.Avatar != picID || !portal.AvatarSet {
+		if picID == "remove" {
+			portal.AvatarURL = id.ContentURI{}
+		} else if portal.Avatar != picID || portal.AvatarURL.IsEmpty() {
+			var err error
+			if picture == nil {
+				meta, err = user.Client.GetNewsletterInfo(portal.Key.JID)
+				if err != nil {
+					portal.log.Warnln("Failed to fetch full res avatar info for newsletter:", err)
+					return false
+				}
+				picture = meta.ThreadMeta.Picture
+				if picture == nil {
+					portal.log.Warnln("Didn't get full res avatar info for newsletter")
+					return false
+				}
+				picID = picture.ID
+			}
+			portal.AvatarURL, err = user.reuploadAvatarDirectPath(portal.MainIntent(), picture.DirectPath)
+			if err != nil {
+				portal.log.Warnln("Failed to reupload newsletter avatar:", err)
+				return false
+			}
+		}
+		portal.Avatar = picID
+		portal.AvatarSet = false
+		return portal.setRoomAvatar(true, types.EmptyJID, true)
+	}
+	return false
+}
+
 func (portal *Portal) UpdateAvatar(user *User, setBy types.JID, updateInfo bool) bool {
+	if portal.IsNewsletter() {
+		return false
+	}
 	portal.avatarLock.Lock()
 	defer portal.avatarLock.Unlock()
 	changed := user.updateAvatar(portal.Key.JID, portal.IsParent, &portal.Avatar, &portal.AvatarURL, &portal.AvatarSet, portal.log, portal.MainIntent())
+	return portal.setRoomAvatar(changed, setBy, updateInfo)
+}
+
+func (portal *Portal) setRoomAvatar(changed bool, setBy types.JID, updateInfo bool) bool {
 	if !changed || portal.Avatar == "unauthorized" {
 		if changed || updateInfo {
 			portal.Update(nil)
@@ -1416,6 +1494,21 @@ func (portal *Portal) UpdateTopic(topic string, setBy types.JID, updateInfo bool
 	return false
 }
 
+func newsletterToGroupInfo(meta *types.NewsletterMetadata) *types.GroupInfo {
+	var out types.GroupInfo
+	out.JID = meta.ID
+	out.Name = meta.ThreadMeta.Name.Text
+	out.NameSetAt = meta.ThreadMeta.Name.UpdateTime.Time
+	out.Topic = meta.ThreadMeta.Description.Text
+	out.TopicSetAt = meta.ThreadMeta.Description.UpdateTime.Time
+	out.TopicID = meta.ThreadMeta.Description.ID
+	out.GroupCreated = meta.ThreadMeta.CreationTime.Time
+	out.IsAnnounce = true
+	out.IsLocked = true
+	out.IsIncognito = true
+	return &out
+}
+
 func (portal *Portal) UpdateParentGroup(source *User, parent types.JID, updateInfo bool) bool {
 	portal.parentGroupUpdateLock.Lock()
 	defer portal.parentGroupUpdateLock.Unlock()
@@ -1460,6 +1553,14 @@ func (portal *Portal) UpdateMetadata(user *User, groupInfo *types.GroupInfo) boo
 		//update = portal.UpdateTopic(BroadcastTopic, "", nil, false) || update
 		return update
 	}
+	if groupInfo == nil && portal.IsNewsletter() {
+		newsletterInfo, err := user.Client.GetNewsletterInfo(portal.Key.JID)
+		if err != nil {
+			portal.zlog.Err(err).Msg("Failed to get newsletter info")
+			return false
+		}
+		groupInfo = newsletterToGroupInfo(newsletterInfo)
+	}
 	if groupInfo == nil {
 		var err error
 		groupInfo, err = user.Client.GetGroupInfo(portal.Key.JID)
@@ -1496,7 +1597,7 @@ func (portal *Portal) ensureUserInvited(user *User) bool {
 	return user.ensureInvited(portal.MainIntent(), portal.MXID, portal.IsPrivateChat())
 }
 
-func (portal *Portal) UpdateMatrixRoom(user *User, groupInfo *types.GroupInfo) bool {
+func (portal *Portal) UpdateMatrixRoom(user *User, groupInfo *types.GroupInfo, newsletterMetadata *types.NewsletterMetadata) bool {
 	if len(portal.MXID) == 0 {
 		return false
 	}
@@ -1505,10 +1606,16 @@ func (portal *Portal) UpdateMatrixRoom(user *User, groupInfo *types.GroupInfo) b
 	portal.ensureUserInvited(user)
 	go portal.addToPersonalSpace(user)
 
+	if groupInfo == nil && newsletterMetadata != nil {
+		groupInfo = newsletterToGroupInfo(newsletterMetadata)
+	}
+
 	update := false
 	update = portal.UpdateMetadata(user, groupInfo) || update
-	if !portal.IsPrivateChat() && !portal.IsBroadcastList() {
+	if !portal.IsPrivateChat() && !portal.IsBroadcastList() && !portal.IsNewsletter() {
 		update = portal.UpdateAvatar(user, types.EmptyJID, false) || update
+	} else if newsletterMetadata != nil {
+		update = portal.UpdateNewsletterAvatar(user, newsletterMetadata) || update
 	}
 	if update || portal.LastSync.Add(24*time.Hour).Before(time.Now()) {
 		portal.LastSync = time.Now()
@@ -1716,7 +1823,7 @@ func (portal *Portal) GetEncryptionEventContent() (evt *event.EncryptionEventCon
 	return
 }
 
-func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, isFullInfo, backfill bool) error {
+func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, newsletterMetadata *types.NewsletterMetadata, isFullInfo, backfill bool) error {
 	portal.roomCreateLock.Lock()
 	defer portal.roomCreateLock.Unlock()
 	if len(portal.MXID) > 0 {
@@ -1763,7 +1870,18 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 		portal.log.Debugln("Broadcast list is not yet supported, not creating room after all")
 		return fmt.Errorf("broadcast list bridging is currently not supported")
 	} else {
-		if groupInfo == nil || !isFullInfo {
+		if portal.IsNewsletter() {
+			if newsletterMetadata == nil {
+				var err error
+				newsletterMetadata, err = user.Client.GetNewsletterInfo(portal.Key.JID)
+				if err != nil {
+					return err
+				}
+			}
+			if groupInfo == nil {
+				groupInfo = newsletterToGroupInfo(newsletterMetadata)
+			}
+		} else if groupInfo == nil || !isFullInfo {
 			foundInfo, err := user.Client.GetGroupInfo(portal.Key.JID)
 
 			// Ensure that the user is actually a participant in the conversation
@@ -1789,7 +1907,11 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 				portal.ExpirationTime = groupInfo.DisappearingTimer
 			}
 		}
-		portal.UpdateAvatar(user, types.EmptyJID, false)
+		if portal.IsNewsletter() {
+			portal.UpdateNewsletterAvatar(user, newsletterMetadata)
+		} else {
+			portal.UpdateAvatar(user, types.EmptyJID, false)
+		}
 	}
 
 	powerLevels := portal.GetBasePowerLevels()
@@ -1868,7 +1990,7 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	autoJoinInvites := portal.bridge.SpecVersions.Supports(mautrix.BeeperFeatureAutojoinInvites)
 	if autoJoinInvites {
 		portal.log.Debugfln("Hungryserv mode: adding all group members in create request")
-		if groupInfo != nil {
+		if groupInfo != nil && !portal.IsNewsletter() {
 			// TODO non-hungryserv could also include all members in invites, and then send joins manually?
 			participants, powerLevels := portal.SyncParticipants(user, groupInfo)
 			invite = append(invite, participants...)
@@ -1936,7 +2058,7 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	go portal.updateCommunitySpace(user, true, true)
 	go portal.addToPersonalSpace(user)
 
-	if groupInfo != nil && !autoJoinInvites {
+	if !portal.IsNewsletter() && groupInfo != nil && !autoJoinInvites {
 		portal.SyncParticipants(user, groupInfo)
 	}
 	//if broadcastMetadata != nil {
@@ -2014,7 +2136,7 @@ func (portal *Portal) updateCommunitySpace(user *User, add, updateInfo bool) boo
 			return false
 		}
 		portal.log.Debugfln("Creating portal for parent group %v", space.Key.JID)
-		err := space.CreateMatrixRoom(user, nil, false, false)
+		err := space.CreateMatrixRoom(user, nil, nil, false, false)
 		if err != nil {
 			portal.log.Debugfln("Failed to create portal for parent group: %v", err)
 			return false
@@ -2062,6 +2184,10 @@ func (portal *Portal) IsGroupChat() bool {
 
 func (portal *Portal) IsBroadcastList() bool {
 	return portal.Key.JID.Server == types.BroadcastServer
+}
+
+func (portal *Portal) IsNewsletter() bool {
+	return portal.Key.JID.Server == types.NewsletterServer
 }
 
 func (portal *Portal) IsStatusBroadcastList() bool {
@@ -3690,6 +3816,9 @@ func (portal *Portal) preprocessMatrixMedia(ctx context.Context, sender *User, r
 		}
 	}
 	mimeType := content.GetInfo().MimeType
+	if mimeType == "" {
+		content.Info.MimeType = "application/octet-stream"
+	}
 	var convertErr error
 	// Allowed mime types from https://developers.facebook.com/docs/whatsapp/on-premises/reference/media
 	switch {
@@ -4053,6 +4182,8 @@ func (portal *Portal) generateContextInfo(relatesTo *event.RelatesTo) *waProto.C
 type extraConvertMeta struct {
 	PollOptions map[[32]byte]string
 	EditRootMsg *database.Message
+
+	GalleryExtraParts []*waProto.Message
 }
 
 func getEditError(rootMsg *database.Message, editer *User) error {
@@ -4163,6 +4294,37 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 			FileEncSha256: media.FileEncSHA256,
 			FileSha256:    media.FileSHA256,
 			FileLength:    proto.Uint64(uint64(media.FileLength)),
+		}
+	case event.MsgBeeperGallery:
+		if isRelay {
+			return nil, sender, extraMeta, errGalleryRelay
+		} else if content.BeeperGalleryCaption != "" {
+			return nil, sender, extraMeta, errGalleryCaption
+		}
+		for i, part := range content.BeeperGalleryImages {
+			// TODO support videos
+			media, err := portal.preprocessMatrixMedia(ctx, sender, false, part, evt.ID, whatsmeow.MediaImage)
+			if media == nil {
+				return nil, sender, extraMeta, fmt.Errorf("failed to handle image #%d: %w", i+1, err)
+			}
+			imageMsg := &waProto.ImageMessage{
+				ContextInfo:   ctxInfo,
+				JpegThumbnail: media.Thumbnail,
+				Url:           &media.URL,
+				DirectPath:    &media.DirectPath,
+				MediaKey:      media.MediaKey,
+				Mimetype:      &part.GetInfo().MimeType,
+				FileEncSha256: media.FileEncSHA256,
+				FileSha256:    media.FileSHA256,
+				FileLength:    proto.Uint64(uint64(media.FileLength)),
+			}
+			if i == 0 {
+				msg.ImageMessage = imageMsg
+			} else {
+				extraMeta.GalleryExtraParts = append(extraMeta.GalleryExtraParts, &waProto.Message{
+					ImageMessage: imageMsg,
+				})
+			}
 		}
 	case event.MessageType(event.EventSticker.Type):
 		media, err := portal.preprocessMatrixMedia(ctx, sender, relaybotFormatted, content, evt.ID, whatsmeow.MediaImage)
@@ -4405,10 +4567,26 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event, timing
 	resp, err := sender.Client.SendMessage(ctx, portal.Key.JID, msg, whatsmeow.SendRequestExtra{ID: info.ID})
 	timings.totalSend = time.Since(start)
 	timings.whatsmeow = resp.DebugTimings
-	go ms.sendMessageMetrics(evt, err, "Error sending", true)
-	if err == nil {
-		dbMsg.MarkSent(resp.Timestamp)
+	if err != nil {
+		go ms.sendMessageMetrics(evt, err, "Error sending", true)
+		return
 	}
+	dbMsg.MarkSent(resp.Timestamp)
+	if len(extraMeta.GalleryExtraParts) > 0 {
+		for i, part := range extraMeta.GalleryExtraParts {
+			partInfo := portal.generateMessageInfo(sender)
+			partDBMsg := portal.markHandled(nil, nil, partInfo, evt.ID, evt.Sender, false, true, database.MsgBeeperGallery, i+1, database.MsgNoError)
+			portal.log.Debugln("Sending gallery part", i+2, "of event", evt.ID, "to WhatsApp", partInfo.ID)
+			resp, err = sender.Client.SendMessage(ctx, portal.Key.JID, part, whatsmeow.SendRequestExtra{ID: partInfo.ID})
+			if err != nil {
+				go ms.sendMessageMetrics(evt, err, "Error sending", true)
+				return
+			}
+			portal.log.Debugfln("Sent gallery part", i+2, "of event", evt.ID)
+			partDBMsg.MarkSent(resp.Timestamp)
+		}
+	}
+	go ms.sendMessageMetrics(evt, nil, "", true)
 }
 
 func (portal *Portal) HandleMatrixReaction(sender *User, evt *event.Event) {
