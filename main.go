@@ -275,14 +275,14 @@ func main() {
 	}
 	br.Bridge = bridge.Bridge{
 		Name:              "mautrix-whatsapp",
-		URL:               "https://github.com/vector-im/mautrix-whatsapp",
+		URL:               "https://github.com/element-hq/mautrix-whatsapp",
 		Description:       "A Matrix-WhatsApp puppeting bridge.",
 		Version:           "0.10.5-mod-1",
 		ProtocolName:      "WhatsApp",
 		BeeperServiceName: "whatsapp",
 		BeeperNetworkName: "whatsapp",
 
-		CryptoPickleKey: "maunium.net/go/mautrix-whatsapp",
+		CryptoPickleKey: "github.com/element-hq/mautrix-whatsapp",
 
 		ConfigUpgrader: &configupgrade.StructUpgrader{
 			SimpleUpgrader: configupgrade.SimpleUpgrader(config.DoUpgrade),
