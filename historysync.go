@@ -34,8 +34,8 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"maunium.net/go/mautrix-whatsapp/config"
-	"maunium.net/go/mautrix-whatsapp/database"
+	"github.com/element-hq/mautrix-whatsapp/config"
+	"github.com/element-hq/mautrix-whatsapp/database"
 )
 
 // region User history sync handling

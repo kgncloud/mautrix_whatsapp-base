@@ -41,8 +41,8 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"maunium.net/go/mautrix-whatsapp/config"
-	"maunium.net/go/mautrix-whatsapp/database"
+	"github.com/element-hq/mautrix-whatsapp/config"
+	"github.com/element-hq/mautrix-whatsapp/database"
 )
 
 const ONE_DAY_S = 24 * 60 * 60

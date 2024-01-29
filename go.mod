@@ -1,4 +1,4 @@
-module maunium.net/go/mautrix-whatsapp
+module github.com/element-hq/mautrix-whatsapp
 
 go 1.20
 

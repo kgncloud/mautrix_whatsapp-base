@@ -28,7 +28,7 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"maunium.net/go/maulogger/v2"
 
-	"maunium.net/go/mautrix-whatsapp/database/upgrades"
+	"github.com/element-hq/mautrix-whatsapp/database/upgrades"
 )
 
 func init() {

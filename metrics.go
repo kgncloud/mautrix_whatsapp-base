@@ -34,7 +34,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"maunium.net/go/mautrix-whatsapp/database"
+	"github.com/element-hq/mautrix-whatsapp/database"
 )
 
 type MetricsHandler struct {
