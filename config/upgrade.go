@@ -76,6 +76,7 @@ func DoUpgrade(helper *up.Helper) {
 	} else {
 		helper.Copy(up.Map, "bridge", "login_shared_secret_map")
 	}
+	helper.Copy(up.Bool, "bridge", "allow_manual_double_puppeting")
 	if legacyPrivateChatPortalMeta, ok := helper.Get(up.Bool, "bridge", "private_chat_portal_meta"); ok {
 		updatedPrivateChatPortalMeta := "default"
 		if legacyPrivateChatPortalMeta == "true" {
