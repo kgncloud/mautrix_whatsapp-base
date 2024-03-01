@@ -24,7 +24,7 @@ import (
 	"go.mau.fi/util/dbutil"
 	log "maunium.net/go/maulogger/v2"
 
-	"maunium.net/go/mautrix/id"
+	"github.com/element-hq/mautrix-go/id"
 )
 
 type MediaBackfillRequestStatus int

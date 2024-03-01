@@ -27,7 +27,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	log "maunium.net/go/maulogger/v2"
 
-	"maunium.net/go/mautrix/id"
+	"github.com/element-hq/mautrix-go/id"
 )
 
 type MessageQuery struct {

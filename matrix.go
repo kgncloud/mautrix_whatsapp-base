@@ -21,11 +21,11 @@ import (
 
 	"go.mau.fi/whatsmeow/types"
 
-	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/bridge"
-	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/format"
-	"maunium.net/go/mautrix/id"
+	"github.com/element-hq/mautrix-go"
+	"github.com/element-hq/mautrix-go/bridge"
+	"github.com/element-hq/mautrix-go/event"
+	"github.com/element-hq/mautrix-go/format"
+	"github.com/element-hq/mautrix-go/id"
 
 	"github.com/element-hq/mautrix-whatsapp/database"
 )

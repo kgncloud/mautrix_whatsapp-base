@@ -20,7 +20,8 @@ import (
 	"time"
 
 	log "maunium.net/go/maulogger/v2"
-	"maunium.net/go/mautrix/id"
+
+	"github.com/element-hq/mautrix-go/id"
 
 	"github.com/element-hq/mautrix-whatsapp/database"
 )

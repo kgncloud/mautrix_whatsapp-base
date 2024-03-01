@@ -23,7 +23,8 @@ import (
 	"net/http"
 
 	log "maunium.net/go/maulogger/v2"
-	"maunium.net/go/mautrix/id"
+
+	"github.com/element-hq/mautrix-go/id"
 )
 
 type AnalyticsClient struct {

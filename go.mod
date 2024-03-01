@@ -3,6 +3,7 @@ module github.com/element-hq/mautrix-whatsapp
 go 1.20
 
 require (
+	github.com/element-hq/mautrix-go v0.16.2-mod-1
 	github.com/gorilla/mux v1.8.0
 	github.com/gorilla/websocket v1.5.0
 	github.com/lib/pq v1.10.9
@@ -19,7 +20,6 @@ require (
 	golang.org/x/net v0.19.0
 	google.golang.org/protobuf v1.31.0
 	maunium.net/go/maulogger/v2 v2.4.1
-	maunium.net/go/mautrix v0.16.2
 )
 
 require (

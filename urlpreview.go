@@ -34,10 +34,10 @@ import (
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 
-	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/appservice"
-	"maunium.net/go/mautrix/crypto/attachment"
-	"maunium.net/go/mautrix/event"
+	"github.com/element-hq/mautrix-go"
+	"github.com/element-hq/mautrix-go/appservice"
+	"github.com/element-hq/mautrix-go/crypto/attachment"
+	"github.com/element-hq/mautrix-go/event"
 )
 
 type BeeperLinkPreview struct {
