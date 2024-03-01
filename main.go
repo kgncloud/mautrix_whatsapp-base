@@ -213,7 +213,17 @@ func (br *WABridge) WarnUsersAboutDisconnection() {
 func (br *WABridge) StartUsers() {
 	br.Log.Debugln("Starting users")
 	foundAnySessions := false
-	for _, user := range br.GetAllUsers() {
+	users := br.GetAllUsers()
+	if !br.Config.Bridge.DoublePuppetConfig.AllowManual {
+		for _, u := range users {
+			customPuppet := br.GetPuppetByCustomMXID(u.MXID)
+			if customPuppet != nil && !br.DoublePuppet.CanAutoDoublePuppet(u.MXID) {
+				br.ZLog.Warn().Stringer("user_id", u.MXID).Msg("User has custom puppet without permission to do so, logging them out of it")
+				customPuppet.ClearCustomMXID()
+			}
+		}
+	}
+	for _, user := range users {
 		if !user.JID.IsEmpty() {
 			foundAnySessions = true
 		}
