@@ -25,9 +25,10 @@ import (
 
 	"go.mau.fi/whatsmeow/types"
 	"golang.org/x/exp/slices"
-	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/format"
-	"maunium.net/go/mautrix/id"
+
+	"github.com/element-hq/mautrix-go/event"
+	"github.com/element-hq/mautrix-go/format"
+	"github.com/element-hq/mautrix-go/id"
 )
 
 var italicRegex = regexp.MustCompile("([\\s>~*]|^)_(.+?)_([^a-zA-Z\\d]|$)")

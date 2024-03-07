@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"maunium.net/go/mautrix/bridge/status"
-	"maunium.net/go/mautrix/id"
+	"github.com/element-hq/mautrix-go/bridge/status"
+	"github.com/element-hq/mautrix-go/id"
 )
 
 const (

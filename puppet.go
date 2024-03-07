@@ -26,10 +26,10 @@ import (
 
 	log "maunium.net/go/maulogger/v2"
 
-	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/appservice"
-	"maunium.net/go/mautrix/bridge"
-	"maunium.net/go/mautrix/id"
+	"github.com/element-hq/mautrix-go"
+	"github.com/element-hq/mautrix-go/appservice"
+	"github.com/element-hq/mautrix-go/bridge"
+	"github.com/element-hq/mautrix-go/id"
 
 	"github.com/element-hq/mautrix-whatsapp/config"
 	"github.com/element-hq/mautrix-whatsapp/database"

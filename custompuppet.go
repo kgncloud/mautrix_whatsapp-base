@@ -17,7 +17,7 @@
 package main
 
 import (
-	"maunium.net/go/mautrix/id"
+	"github.com/element-hq/mautrix-go/id"
 )
 
 func (puppet *Puppet) SwitchCustomMXID(accessToken string, mxid id.UserID) error {
@@ -68,7 +68,7 @@ func (puppet *Puppet) StartCustomMXID(reloginOnFail bool) error {
 }
 
 func (user *User) tryAutomaticDoublePuppeting() {
-	if !user.bridge.Config.CanAutoDoublePuppet(user.MXID) {
+	if !user.bridge.DoublePuppet.CanAutoDoublePuppet(user.MXID) {
 		return
 	}
 	user.zlog.Debug().Msg("Checking if double puppeting needs to be enabled")

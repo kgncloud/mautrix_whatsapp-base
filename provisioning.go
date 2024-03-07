@@ -38,8 +38,8 @@ import (
 
 	log "maunium.net/go/maulogger/v2"
 
-	"maunium.net/go/mautrix/bridge/status"
-	"maunium.net/go/mautrix/id"
+	"github.com/element-hq/mautrix-go/bridge/status"
+	"github.com/element-hq/mautrix-go/id"
 )
 
 type ProvisioningAPI struct {
